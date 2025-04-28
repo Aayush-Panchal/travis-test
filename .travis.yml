@@ -16,15 +16,16 @@ env:
     - DISTRO=sle16sp0
  
 before_install:
-  # Workaround Travis CI timeout: keep-alive output every 5 minutes
-  - while true; do echo "Still running..."; sleep 300; done &
- 
-  # Ensure full git fetch
-  - git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
- 
-  # Pull the Docker image early
-- REPO_URL="${REPO_URL:-icr.io/sys-kernelbackport}"
-  - docker pull "${REPO_URL}/${DISTRO}" || true
+  - |
+    # Keep-alive workaround for Travis timeout
+    (while true; do echo "Still running..."; sleep 300; done) &
+  - |
+    # Ensure full git fetch
+    git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+  - |
+    # Prepare REPO_URL and pull the Docker image early
+REPO_URL="${REPO_URL:-icr.io/sys-kernelbackport}"
+    docker pull "${REPO_URL}/${DISTRO}" || true
  
 install: []
  
@@ -33,12 +34,13 @@ branches:
     - master
  
 script:
-  # Login to Docker
-- echo "${My_Password}" | docker login -u iamapikey --password-stdin icr.io
- 
-  # Ensure pulling the Docker image (again, in case before_install failed)
-  - docker pull "${REPO_URL}/${DISTRO}"
- 
-  # Run the container and execute the update
-  - docker run -v "$(pwd)":/root/kernels -w /root/kernels/ -it "${REPO_URL}/${DISTRO}" /root/kernels/.update \
+  - |
+    # Login to Docker
+echo "${My_Password}" | docker login -u iamapikey --password-stdin icr.io
+  - |
+    # Pull the Docker image (again, if needed)
+    docker pull "${REPO_URL}/${DISTRO}"
+  - |
+    # Run the container with mounted workspace and execute .update script
+    docker run -v "$(pwd)":/root/kernels -w /root/kernels/ -it "${REPO_URL}/${DISTRO}" /root/kernels/.update \
       -f "${FTP3_Credentials}" -d "${DISTRO}" -n "${My_Name}" -e "${My_Email}"
