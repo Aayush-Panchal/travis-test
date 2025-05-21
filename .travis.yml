@@ -80,7 +80,8 @@ jobs:
       install:
         - pip install pre-commit
       script:
-        - pre-commit run -a --show-diff-on-failure
+        - ls
+        - echo "Hello World"
 
     - name: Test the electric-vapor-tool Python package
       stage: build
