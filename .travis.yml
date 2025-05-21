@@ -1,29 +1,269 @@
-sudo: required
-language: shell
+# Travis CI configuration for electric-vapor.
+
+cache:
+  directories:
+    - $HOME/.cache/pre-commit
+
+# All jobs run on x86_64 Linux by default.
 os: linux
-arch: ppc64le
-group: power-test
 
-git:
-  submodules: false
-  depth: 10
-
-services:
-  - docker
+# Default to Ubuntu 20.04
+# See https://docs.travis-ci.com/user/reference/focal/ for a list of included
+# software. Ubuntu 22.04 (jammy) can be chosen, but it silently downgrades to
+# focal, because there are no jammy runners available in IBM.
+dist: focal
 
 env:
-    matrix:
-       - DISTRO=sle16sp0
-    
-install:
-  - git config remote.origin.fetch +refs/heads/*:refs/remotes/origin/*
+  global:
+    # Use BuildKit as "docker build" backend, which supports e.g. secrets.
+    - DOCKER_BUILDKIT=1
+    # Avoid spamming the Travis log with intermediate status information intended
+    # for an interactive terminal.
+    - BUILDKIT_PROGRESS=plain
+    # The Docker image registry to push containers to.
+    - OCI_REGISTRY=icr.io
+    - OCI_REGISTRY_BASEPATH=electric-vapor
+    - OCI_REGISTRY_PATH_IMAGES=$OCI_REGISTRY_BASEPATH/images
+    # Shared configuration used by container-images/Makefile
+    - CONTAINER_ENGINE_CMD=docker
+    - IMAGE_TAG_STABLE=latest
 
 branches:
+  # Don't run Travis on feature branches, they get tested through PR runs.
+  #
+  # Developers push feature branches to the origin repository (instead of using
+  # a fork). Developers then create a pull request for the feature branch. This
+  # leads to two Travis builds per pull request: one for the PR itself, and one
+  # for the branch push.
   only:
     - main
 
-script:
-  - REPO_URL="${REPO_URL:-icr.io/sys-kernelbackport}"
-  - echo ${My_Password} | docker login -u iamapikey --password-stdin icr.io
-  - docker pull ${REPO_URL}/${DISTRO}
-  - docker run -v $(pwd):/root/kernels -w /root/kernels/ -it ${REPO_URL}/${DISTRO} /root/kernels/.update -f "${FTP3_Credentials}" -d "${DISTRO}" -n "${My_Name}" -e "${My_Email}"
+stages:
+  - lint
+  - build
+  # The deployment stage publishes build artifacts. Only run on changes in the
+  # main branch.
+  - name: deploy
+    if: branch = main AND type = push
+
+jobs:
+  include:
+    # Lint checks running only in pull requests. Typically that includes all
+    # checks which check the newly introduced commits, as opposed to the state
+    # of the repository after the changes have been made.
+    #
+    # We want to check the commit message for the same commits as they are
+    # listed in the GitHub web UI.
+    # Travis builds against a GitHub-created branch which effectively is the
+    # result of the PR branch merged into master. The resulting set of commits
+    # is also reflected in the TRAVIS_COMMIT_RANGE environment variable, which
+    # in turn triggers the commit message lint on commit messages which are
+    # already included in the main branch.
+    # Avoid that by using TRAVIS_PULL_REQUEST_SHA (which is the tip of the PR
+    # branch) and calculate the point when we forked off main manually.
+    - name: PR lint
+      stage: lint
+      if: type = pull_request
+      language: python
+      python:
+        - 3.9.21
+      install:
+        - pip install pre-commit
+      script:
+        - .ci/check_commits.sh "$(git merge-base origin/$TRAVIS_BRANCH $TRAVIS_PULL_REQUEST_SHA)...$TRAVIS_PULL_REQUEST_SHA"
+
+    - name: Lint
+      stage: lint
+      language: python
+      python:
+        - 3.9.21
+      install:
+        - pip install pre-commit
+      script:
+        - pre-commit run -a --show-diff-on-failure
+
+    - name: Test the electric-vapor-tool Python package
+      stage: build
+      language: shell
+      script:
+        # Get credentials.
+        - source ./.ci/get-cred.sh
+
+        # Run tests through pytest.
+        #
+        # Some tested modules indirectly depend on the "rpm" Python package,
+        # which is only available on RPM-based distributions. Run tests in a
+        # RHEL-compatible environment instead of on Ubuntu.
+        - |
+          docker run \
+            --security-opt apparmor=unconfined \
+            -v $(pwd):/repo \
+            -v /run/secrets:/run/secrets \
+            --workdir=/repo \
+            --user=0:0 \
+            -it \
+            $OCI_REGISTRY/$OCI_REGISTRY_PATH_IMAGES/base:latest \
+            "sudo dnf install -y python3.9 git rpm-build \
+              && python3.9 -m pip install ./electric-vapor-tool[test] \
+              && cd electric-vapor-tool/tests \
+              && pytest -sv"
+
+    - name: Build, test, and upload RPM packages (x86_64)
+      stage: build
+      os: Linux
+      language: python
+      python:
+        - 3.9.21
+      script:
+        # Get credentials.
+        - source ./.ci/get-cred.sh
+
+        # Build, test, and potentially deploy the RPM packages in a RHEL8
+        # container.
+        - |
+          if [ "$TRAVIS_PULL_REQUEST" == "false" ] && [ "$TRAVIS_BRANCH" == "main" ]; then
+            PACKAGE_ACTION=build-test-upload
+          else
+            PACKAGE_ACTION=build-test
+          fi
+          docker run \
+            --security-opt apparmor=unconfined \
+            -v $(pwd):/repo \
+            -v /run/secrets:/run/secrets \
+            -e PACKAGE_ACTION=$PACKAGE_ACTION \
+            --workdir=/repo \
+            --user=0:0 \
+            -it \
+            $OCI_REGISTRY/$OCI_REGISTRY_PATH_IMAGES/base:latest \
+            /repo/.ci/package_ci.sh
+
+    - name: Build, test, and upload RPM packages (ppc64le)
+      stage: build
+      os: linux
+      arch: ppc64le
+      group: power-focal
+      language: python
+      python:
+        - 3.9.15 # latest 3.9.x version available for ppc64le on Travis.
+      script:
+        # Get credentials.
+        - source ./.ci/get-cred.sh
+
+        # Build, test, and potentially deploy the RPM packages in a RHEL8
+        # container.
+        - |
+          if [ "$TRAVIS_PULL_REQUEST" == "false" ] && [ "$TRAVIS_BRANCH" == "main" ]; then
+            PACKAGE_ACTION=build-test-upload
+          else
+            PACKAGE_ACTION=build-test
+          fi
+          docker run \
+            --security-opt apparmor=unconfined \
+            -v $(pwd):/repo \
+            -v /run/secrets:/run/secrets \
+            -e PACKAGE_ACTION=$PACKAGE_ACTION \
+            --workdir=/repo \
+            --user=0:0 \
+            -it \
+            $OCI_REGISTRY/$OCI_REGISTRY_PATH_IMAGES/base:latest \
+            /repo/.ci/package_ci.sh
+
+    - name: Build and push container images (x86_64)
+      stage: build
+      os: Linux
+      language: shell
+      script:
+        # Get credentials.
+        - source ./.ci/get-cred.sh
+
+        # Build the container images.
+        - |
+          make --environment-overrides -C container-images build-image-base build-image-chipdev
+
+        # If we're running main branch CI:
+        # Push the tagged images to the Artifactory Docker registry.
+        - |
+          if [ "$TRAVIS_PULL_REQUEST" == "false" ] && [ "$TRAVIS_BRANCH" == "main" ]; then
+            make --environment-overrides -C container-images push-image-base push-image-chipdev
+          else
+            echo "Only pushing container images in main branch builds."
+          fi
+
+    - name: Build and push container images (ppc64le)
+      stage: build
+      os: linux
+      arch: ppc64le
+      group: power-focal
+      language: shell
+      script:
+        # Get credentials.
+        - source ./.ci/get-cred.sh
+
+        # Build the container images.
+        - |
+          make --environment-overrides -C container-images build-image-base build-image-chipdev
+
+        # If we're running main branch CI:
+        # Push the tagged images to the Artifactory Docker registry.
+        - |
+          if [ "$TRAVIS_PULL_REQUEST" == "false" ] && [ "$TRAVIS_BRANCH" == "main" ]; then
+            make --environment-overrides -C container-images push-image-base push-image-chipdev
+          else
+            echo "Only pushing container images in main branch builds."
+          fi
+
+    - name: Build and publish Dev Container Features
+      stage: build
+      language: node_js
+      node_js:
+        - '18'
+      install:
+        - .ci/install_devcontainer_cli.sh
+      script:
+        - make --environment-overrides -C devcontainer-features package
+
+        # If we're running main branch CI:
+        # Push the Dev Container Features to the Artifactory OCI registry.
+        # The devcontainer CLI uses authentication information from docker, log
+        # in to make that available.
+        # `devcontainer publish` will only publish versions which have not been
+        # published yet, i.e., only if `version` in `devcontainer-feature.json`
+        # changed.
+        - |
+          if [ "$TRAVIS_PULL_REQUEST" == "false" ] && [ "$TRAVIS_BRANCH" == "main" ]; then
+            source ./.ci/get-cred.sh
+            make --environment-overrides -C devcontainer-features publish
+          else
+            echo "Only publishing Dev Container Feature packages in main branch builds."
+          fi
+
+    # Travis provides a built-in way of deploying to GitHub pages using a tool
+    # called "dpl". Unfortunately, neither v1 nor v2 seem to work with the
+    # latest version of Travis. Travis reports (without further explanation):
+    # "Failed to push the build to github.ibm.com/ChipDesignDevOps/electric-vapor.git:gh-pages"
+    # The access token is correct and can be used when pushing manually, as the
+    # code below indicates. Since dpl has given us a wide range of pain over
+    # time it's maybe best avoided.
+    - name: Build and deploy the documentation to GitHub Pages
+      stage: deploy
+      language: python
+      python:
+        - 3.9.21
+      script:
+        - pip install nox
+        - nox -s doc
+        - source ./.ci/get-cred.sh
+        - echo "machine github.ibm.com login $GH_ENTERPRISE_TOKEN" > ~/.netrc
+        - |
+          set -xeo pipefail
+          DOCS_OUT="$(pwd)/.nox/.cache/docs_out"
+          mkdir /tmp/electric-vapor-pages-deploy
+          cd /tmp/electric-vapor-pages-deploy
+          git clone https://github.ibm.com/ChipDesignDevOps/electric-vapor.git
+          cd electric-vapor
+          git checkout gh-pages
+          rsync -r --links --cvs-exclude --delete "$DOCS_OUT/" .
+          git add .
+          git status
+          git commit --author="$IBM_USER" -m "Docs for $TRAVIS_COMMIT"
+          git push
